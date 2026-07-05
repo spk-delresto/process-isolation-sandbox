@@ -1,3 +1,4 @@
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,4 +27,37 @@ static int read_password(char *buf, size_t buflen) {
         if (!fgets(buf, buflen, stdin)) return -1;
         buf[strcspn(buf, "\n")] = 0;
         return 0;
+    }
+    newt = oldt;
+    newt.c_lflag &= ~ECHO;
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+    int ok = fgets(buf, buflen, stdin) != NULL;
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt); /* always restore terminal */
+    printf("\n");
+
+    if (!ok) return -1;
+    buf[strcspn(buf, "\n")] = 0;
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    char user[MAX_USER] = {0};
+    char pass[MAX_PASS] = {0};
+
+    fprintf(stderr, "[frontend] running as uid=%d (unprivileged, by design)\n", getuid());
+
+    if (argc >= 3) {
+        /* Non-interactive mode for scripted testing: frontend <user> <pass> */
+        strncpy(user, argv[1], sizeof(user) - 1);
+        strncpy(pass, argv[2], sizeof(pass) - 1);
+    } else {
+        printf("Username: ");
+        fflush(stdout);
+        if (!fgets(user, sizeof(user), stdin)) return EXIT_FAILURE;
+        user[strcspn(user, "\n")] = 0;
+
+        printf("Password: ");
+        fflush(stdout);
+        if (read_password(pass, sizeof(pass)) != 0) return EXIT_FAILURE;
     }
