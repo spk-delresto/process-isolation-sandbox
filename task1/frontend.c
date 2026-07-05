@@ -1,4 +1,3 @@
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,3 +60,44 @@ int main(int argc, char **argv) {
         fflush(stdout);
         if (read_password(pass, sizeof(pass)) != 0) return EXIT_FAILURE;
     }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket"); return EXIT_FAILURE; }
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("connect (is backend running?)");
+        secure_zero(pass, sizeof(pass));
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    char msg[MAX_USER + MAX_PASS + 2];
+    int len = snprintf(msg, sizeof(msg), "%s\x01%s", user, pass);
+
+    if (write(fd, msg, len) != len) {
+        perror("write");
+    }
+
+    /* Wipe local copies immediately after transmission. */
+    secure_zero(pass, sizeof(pass));
+    secure_zero(msg, sizeof(msg));
+
+    char reply[64] = {0};
+    ssize_t n = read(fd, reply, sizeof(reply) - 1);
+    close(fd);
+
+    if (n <= 0) {
+        fprintf(stderr, "[frontend] no response from backend\n");
+        return EXIT_FAILURE;
+    }
+    reply[n] = 0;
+    printf("Result: %s", reply);
+
+    int allowed = strncmp(reply, "ALLOW", 5) == 0;
+    secure_zero(user, sizeof(user));
+    return allowed ? EXIT_SUCCESS : EXIT_FAILURE;
+}
