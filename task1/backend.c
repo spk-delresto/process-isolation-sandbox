@@ -139,3 +139,123 @@ static int validate_credentials(FILE *db, const char *user, const char *pass) {
     }
     return ok;
 }
+
+/* ---- receive kernel-verified peer credentials over the UNIX socket ---- */
+static int check_peer_credentials(int fd) {
+    struct ucred cred;
+    socklen_t len = sizeof(cred);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) {
+        perror("getsockopt(SO_PEERCRED)");
+        return -1;
+    }
+    fprintf(stderr, "[backend] peer credentials -> pid=%d uid=%d gid=%d\n",
+            cred.pid, cred.uid, cred.gid);
+    /* Example policy: reject requests from uid 0 connecting to us -
+       the frontend is expected to run unprivileged. Extend as needed. */
+    return 0;
+}
+
+static void handle_client(int fd, FILE *db, uid_t target_uid) {
+    /* Attack-resistance re-check on every single request (Deliverable #4) */
+    if (confirm_unprivileged(target_uid) != 0) {
+        const char *msg = "DENY:internal-error\n";
+        write(fd, msg, strlen(msg));
+        close(fd);
+        return;
+    }
+
+    if (check_peer_credentials(fd) != 0) {
+        close(fd);
+        return;
+    }
+
+    char user[MAX_USER] = {0};
+    char pass[MAX_PASS] = {0};
+    char buf[MAX_USER + MAX_PASS + 2] = {0};
+
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    if (n <= 0) { close(fd); return; }
+    buf[n] = 0;
+
+    char *sep = strchr(buf, '\x01');   /* field separator */
+    if (!sep) {
+        const char *msg = "DENY:malformed-request\n";
+        write(fd, msg, strlen(msg));
+        secure_zero(buf, sizeof(buf));
+        close(fd);
+        return;
+    }
+    *sep = 0;
+    strncpy(user, buf, sizeof(user) - 1);
+    strncpy(pass, sep + 1, sizeof(pass) - 1);
+
+    int ok = validate_credentials(db, user, pass);
+
+    const char *result = ok ? "ALLOW\n" : "DENY\n";
+    write(fd, result, strlen(result));
+
+    fprintf(stderr, "[backend] validation for user='%s' -> %s", user, result);
+
+    /* Wipe plaintext password (and the raw buffer) as soon as it is no
+       longer needed (Investigation Q10/11/12). */
+    secure_zero(pass, sizeof(pass));
+    secure_zero(buf, sizeof(buf));
+
+    close(fd);
+}
+
+static volatile sig_atomic_t g_running = 1;
+static void handle_sigterm(int sig) { (void)sig; g_running = 0; }
+
+int main(void) {
+    signal(SIGTERM, handle_sigterm);
+    signal(SIGINT, handle_sigterm);
+    signal(SIGPIPE, SIG_IGN);
+
+    fprintf(stderr, "[backend] starting as uid=%d euid=%d\n", getuid(), geteuid());
+
+    /* 1. Privileged step performed BEFORE dropping root. */
+    FILE *db = open_creddb_privileged();
+
+    /* 2. Set up the listening socket while we still have permission to
+       bind wherever policy requires (kept simple here: /tmp). */
+    unlink(SOCK_PATH);
+    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv < 0) { perror("socket"); exit(EXIT_FAILURE); }
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("bind");
+        exit(EXIT_FAILURE);
+    }
+    chmod(SOCK_PATH, 0666); /* demo only: real deployments should use group perms */
+
+    if (listen(srv, 8) != 0) { perror("listen"); exit(EXIT_FAILURE); }
+
+    /* 3. Permanently drop privileges. From this point on the process can
+          never regain root, by construction of setresuid(). */
+    struct passwd *target = getpwnam(UNPRIV_USER);
+    uid_t target_uid = target ? target->pw_uid : getuid();
+    drop_privileges_permanently(UNPRIV_USER);
+
+    fprintf(stderr, "[backend] listening on %s (unprivileged)\n", SOCK_PATH);
+
+    while (g_running) {
+        int fd = accept(srv, NULL, NULL);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept");
+            break;
+        }
+        handle_client(fd, db, target_uid);
+    }
+
+    fclose(db);
+    close(srv);
+    unlink(SOCK_PATH);
+    fprintf(stderr, "[backend] shut down cleanly\n");
+    return 0;
+}
