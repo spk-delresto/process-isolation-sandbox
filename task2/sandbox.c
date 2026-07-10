@@ -162,3 +162,65 @@ static void *resource_watcher(void *arg) {
     }
     return NULL;
 }
+
+/* ---- Thread 3: enforcement thread - actually delivers the kill ---- */
+static void *enforcement_watcher(void *arg) {
+    (void)arg;
+    while (1) {
+        if (atomic_load(&g_state.should_terminate)) {
+            if (atomic_load(&g_state.termination_reason) == REASON_CHILD_EXITED) {
+                return NULL; /* child already gone on its own - nothing to enforce */
+            }
+            pid_t pid = g_state.child_pid;
+            if (pid > 0 && kill(pid, 0) != 0) {
+                /* Process is already gone (e.g. it exited right as the
+                   deadline fired) - nothing left to enforce against. */
+                return NULL;
+            }
+            if (pid > 0) {
+                log_line("ENFORCEMENT: sending SIGSTOP then SIGKILL to pid %d", pid);
+                /* SIGSTOP first: freezes the process so it cannot fork,
+                   spawn helpers, or otherwise race the kill. Then SIGKILL,
+                   which - unlike SIGTERM - cannot be caught, blocked or
+                   ignored by the target (Investigation Q6). */
+                kill(pid, SIGSTOP);
+                usleep(50000);
+                kill(pid, SIGKILL);
+            }
+            return NULL;
+        }
+        /* Also exit this thread if the child already exited on its own. */
+        int status;
+        pid_t r = waitpid(g_state.child_pid, &status, WNOHANG | WUNTRACED);
+        if (r == g_state.child_pid && !WIFSTOPPED(status)) {
+            int expected = 0;
+            atomic_compare_exchange_strong(&g_state.termination_reason, &expected, REASON_CHILD_EXITED);
+            return NULL;
+        }
+        usleep(POLL_INTERVAL_US);
+    }
+}
+
+static void set_child_resource_limits(void) {
+    /* Belt-and-braces kernel-enforced limits, in addition to the
+       userspace watchers above, so the sandbox is defence-in-depth
+       rather than relying solely on the polling threads. */
+    struct rlimit rl;
+
+    rl.rlim_cur = MAX_CPU_SECONDS + 1;
+    rl.rlim_max = MAX_CPU_SECONDS + 2;
+    setrlimit(RLIMIT_CPU, &rl);
+
+    /* Kernel-enforced backstop set noticeably above the userspace
+       watcher's threshold, so the polling watcher (which produces an
+       auditable log entry and a controlled SIGSTOP/SIGKILL sequence)
+       is normally the one that catches the violation first; RLIMIT_AS
+       only fires if the watcher's poll interval is somehow missed. */
+    rl.rlim_cur = (rlim_t)MAX_RSS_KB * 1024 * 2;
+    rl.rlim_max = (rlim_t)MAX_RSS_KB * 1024 * 2;
+    setrlimit(RLIMIT_AS, &rl);
+
+    rl.rlim_cur = 64;
+    rl.rlim_max = 64;
+    setrlimit(RLIMIT_NPROC, &rl); /* limit fork-bomb style behaviour */
+}
