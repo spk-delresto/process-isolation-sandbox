@@ -224,3 +224,81 @@ static void set_child_resource_limits(void) {
     rl.rlim_max = 64;
     setrlimit(RLIMIT_NPROC, &rl); /* limit fork-bomb style behaviour */
 }
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <untrusted-binary> [args...]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    memset(&g_state, 0, sizeof(g_state));
+    pthread_mutex_init(&g_state.log_lock, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &g_state.start_time);
+    atomic_store(&g_state.should_terminate, 0);
+    atomic_store(&g_state.termination_reason, REASON_NONE);
+
+    log_line("Launching sandboxed target: %s", argv[1]);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return EXIT_FAILURE;
+    }
+
+    if (pid == 0) {
+        /* ---- CHILD: becomes the untrusted binary, nothing more ---- */
+        set_child_resource_limits();
+        /* The child never runs any sandbox logic beyond this point,
+           satisfying "the untrusted binary must not take part in its
+           own monitoring or termination" - after execve() this address
+           space is entirely replaced by the target program. */
+        execve(argv[1], &argv[1], NULL);
+        perror("execve"); /* only reached if execve fails */
+        _exit(127);
+    }
+
+    /* ---- PARENT: supervisor ---- */
+    g_state.child_pid = pid;
+    log_line("Child pid=%d started, supervising...", pid);
+
+    pthread_t t_timer, t_resource, t_enforce;
+    pthread_create(&t_timer, NULL, timer_watcher, NULL);
+    pthread_create(&t_resource, NULL, resource_watcher, NULL);
+    pthread_create(&t_enforce, NULL, enforcement_watcher, NULL);
+
+    int status = 0;
+    pid_t r = waitpid(pid, &status, 0);
+
+    /* Child has terminated one way or another: signal all watcher
+       threads to stop and join them before reporting the result. */
+    atomic_store(&g_state.should_terminate, 1);
+    pthread_join(t_timer, NULL);
+    pthread_join(t_resource, NULL);
+    pthread_join(t_enforce, NULL);
+
+    if (r < 0) {
+        perror("waitpid");
+        return EXIT_FAILURE;
+    }
+
+    int reason = atomic_load(&g_state.termination_reason);
+    const char *reason_str =
+        reason == REASON_WALL_TIMEOUT ? "WALL_CLOCK_TIMEOUT" :
+        reason == REASON_CPU_LIMIT    ? "CPU_LIMIT_EXCEEDED" :
+        reason == REASON_MEM_LIMIT    ? "MEMORY_LIMIT_EXCEEDED" :
+        "CHILD_SELF_TERMINATED";
+
+    if (WIFEXITED(status)) {
+        log_line("RESULT: child exited normally with code %d (reason=%s)",
+                  WEXITSTATUS(status), reason_str);
+    } else if (WIFSIGNALED(status)) {
+        log_line("RESULT: child terminated by signal %d (%s) (reason=%s)",
+                  WTERMSIG(status), strsignal(WTERMSIG(status)), reason_str);
+    } else {
+        log_line("RESULT: child ended with unexpected status 0x%x (reason=%s)",
+                  status, reason_str);
+    }
+
+    pthread_mutex_destroy(&g_state.log_lock);
+    return 0;
+}
